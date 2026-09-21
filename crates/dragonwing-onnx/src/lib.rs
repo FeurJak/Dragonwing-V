@@ -71,6 +71,7 @@ mod graph;
 mod runtime;
 mod postprocess;
 mod fusion;
+mod qdq;
 #[cfg(feature = "cpu")]
 mod calibration;
 #[cfg(feature = "cpu")]
@@ -87,6 +88,7 @@ pub use graph::{Graph, validate_model, compile_model, fold_batchnorm,
 pub use runtime::GraphRuntime;
 pub use postprocess::{Detection, iou, decode_detections_v8, decode_detections_v8_alt, nms, nms_agnostic, postprocess_yolo};
 pub use fusion::{apply_fusion_passes, count_fuseable_patterns, FusionStats};
+pub use qdq::{fold_qdq_patterns, graph_has_qdq, QdqFoldStats};
 
 /// CPU-optimized graph runtime (requires `cpu` feature).
 #[cfg(feature = "cpu")]

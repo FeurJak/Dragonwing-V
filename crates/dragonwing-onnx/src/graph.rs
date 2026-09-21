@@ -260,20 +260,30 @@ pub fn convert_nchw_to_nhwc(graph: &mut Graph) -> Result<()> {
     
     // Transpose Conv weight initializers: [C_out, C_in, kH, kW] → [kH, kW, C_in, C_out]
     for weight_name in &conv_weight_names {
-        if let Some(shape) = graph.shapes.get(weight_name) {
-            if shape.dims.len() == 4 {
-                let orig_shape = shape.dims.clone();  // [C_out, C_in, kH, kW]
-                
-                if let Some(data) = graph.initializers.get_mut(weight_name) {
-                    // Transpose data: perm [2, 3, 1, 0] to get [kH, kW, C_in, C_out]
-                    *data = transpose_f32_4d(data, &orig_shape, &[2, 3, 1, 0]);
+        // Snapshot dtype + dims so we don't hold a borrow into graph.shapes.
+        let (dtype, orig_shape) = match graph.shapes.get(weight_name) {
+            Some(s) if s.dims.len() == 4 => (s.dtype, s.dims.clone()),
+            _ => continue,
+        };
+
+        if let Some(data) = graph.initializers.get_mut(weight_name) {
+            // perm [2, 3, 1, 0] yields [kH, kW, C_in, C_out] from OIHW.
+            *data = match dtype {
+                Dtype::F32 => transpose_f32_4d(data, &orig_shape, &[2, 3, 1, 0]),
+                Dtype::I8 => transpose_i8_4d(data, &orig_shape, &[2, 3, 1, 0]),
+                Dtype::F16 => transpose_f16_4d(data, &orig_shape, &[2, 3, 1, 0]),
+                other => {
+                    // Unknown weight dtype — leave data alone but log via
+                    // shape mismatch. Caller's responsibility to know.
+                    return Err(Error::Compile(format!(
+                        "convert_nchw_to_nhwc: unsupported weight dtype {other:?} for {weight_name}"
+                    )));
                 }
-                
-                // Update shape: [C_out, C_in, kH, kW] → [kH, kW, C_in, C_out]
-                if let Some(s) = graph.shapes.get_mut(weight_name) {
-                    s.dims = vec![orig_shape[2], orig_shape[3], orig_shape[1], orig_shape[0]];
-                }
-            }
+            };
+        }
+
+        if let Some(s) = graph.shapes.get_mut(weight_name) {
+            s.dims = vec![orig_shape[2], orig_shape[3], orig_shape[1], orig_shape[0]];
         }
     }
     
@@ -330,6 +340,80 @@ fn transpose_f32_4d(data: &[u8], shape: &[usize], perm: &[usize; 4]) -> Vec<u8> 
     }
     
     dst.iter().flat_map(|f| f.to_le_bytes()).collect()
+}
+
+/// Transpose a 4D INT8 tensor.
+///
+/// Same semantics as [`transpose_f32_4d`] but for 1-byte/element tensors.
+/// Used to reorder INT8 weight initializers from OIHW to HWIO during the
+/// NCHW→NHWC conversion (Task 009 — needed once QDQ-folded INT8 weights
+/// flow through the layout pass).
+fn transpose_i8_4d(data: &[u8], shape: &[usize], perm: &[usize; 4]) -> Vec<u8> {
+    let numel: usize = shape.iter().product();
+    if data.len() != numel {
+        return data.to_vec();
+    }
+
+    let [d0, d1, d2, d3] = [shape[0], shape[1], shape[2], shape[3]];
+    let out_shape = [shape[perm[0]], shape[perm[1]], shape[perm[2]], shape[perm[3]]];
+    let mut dst = vec![0u8; numel];
+
+    for i0 in 0..d0 {
+        for i1 in 0..d1 {
+            for i2 in 0..d2 {
+                for i3 in 0..d3 {
+                    let src_idx = ((i0 * d1 + i1) * d2 + i2) * d3 + i3;
+                    let indices = [i0, i1, i2, i3];
+                    let mut out_idx = [0usize; 4];
+                    for (out_dim, &src_dim) in perm.iter().enumerate() {
+                        out_idx[out_dim] = indices[src_dim];
+                    }
+                    let dst_idx = ((out_idx[0] * out_shape[1] + out_idx[1]) * out_shape[2]
+                        + out_idx[2])
+                        * out_shape[3]
+                        + out_idx[3];
+                    dst[dst_idx] = data[src_idx];
+                }
+            }
+        }
+    }
+
+    dst
+}
+
+/// Transpose a 4D F16 tensor (2 bytes per element).
+fn transpose_f16_4d(data: &[u8], shape: &[usize], perm: &[usize; 4]) -> Vec<u8> {
+    let numel: usize = shape.iter().product();
+    if data.len() != numel * 2 {
+        return data.to_vec();
+    }
+
+    let [d0, d1, d2, d3] = [shape[0], shape[1], shape[2], shape[3]];
+    let out_shape = [shape[perm[0]], shape[perm[1]], shape[perm[2]], shape[perm[3]]];
+    let mut dst = vec![0u8; numel * 2];
+
+    for i0 in 0..d0 {
+        for i1 in 0..d1 {
+            for i2 in 0..d2 {
+                for i3 in 0..d3 {
+                    let src_idx = ((i0 * d1 + i1) * d2 + i2) * d3 + i3;
+                    let indices = [i0, i1, i2, i3];
+                    let mut out_idx = [0usize; 4];
+                    for (out_dim, &src_dim) in perm.iter().enumerate() {
+                        out_idx[out_dim] = indices[src_dim];
+                    }
+                    let dst_idx = ((out_idx[0] * out_shape[1] + out_idx[1]) * out_shape[2]
+                        + out_idx[2])
+                        * out_shape[3]
+                        + out_idx[3];
+                    dst[dst_idx * 2] = data[src_idx * 2];
+                    dst[dst_idx * 2 + 1] = data[src_idx * 2 + 1];
+                }
+            }
+        }
+    }
+
+    dst
 }
 
 /// Transpose input data from NCHW to NHWC format.
@@ -509,6 +593,10 @@ fn onnx_dtype_to_dragonwing(onnx_dtype: DataType, default: Dtype) -> Dtype {
     match onnx_dtype {
         DataType::Float => Dtype::F32,
         DataType::Float16 => Dtype::F16,
+        // Task 009 — INT8 initializers (pre-quantized weights from
+        // ONNX Runtime QDQ export) keep their I8 dtype so the QDQ-fold
+        // pass can recognise them without trying to re-quantize.
+        DataType::Int8 | DataType::Uint8 => Dtype::I8,
         // For weights stored as other types, use the graph's default dtype
         _ => default,
     }
@@ -722,6 +810,76 @@ mod tests {
             let val = f32::from_le_bytes([bytes[0], bytes[1], bytes[2], bytes[3]]);
             assert!((val - expected[i]).abs() < 1e-6, "elem {i}: {val} vs {}", expected[i]);
         }
+    }
+
+    #[test]
+    fn test_transpose_i8_4d_roundtrip() {
+        // OIHW shape [C_out=2, C_in=2, kH=2, kW=2]; perm [2,3,1,0] → HWIO
+        // [kH=2, kW=2, C_in=2, C_out=2].
+        let shape = [2usize, 2, 2, 2];
+        let numel: usize = shape.iter().product();
+        let data: Vec<u8> = (0..numel as u8).collect();
+        let out = transpose_i8_4d(&data, &shape, &[2, 3, 1, 0]);
+        assert_eq!(out.len(), numel);
+
+        // Spot check: source [oc=0, ic=0, h=0, w=0] = 0 should land at
+        // dst[h=0, w=0, ic=0, oc=0] = 0 (corner). Source [oc=1, ic=0, h=0,
+        // w=0] = 8 should land at dst[h=0, w=0, ic=0, oc=1] = 1.
+        // dst layout strides: w stride = 2 (oc), ic stride = 4 (w*oc=2*2),
+        // h stride = 8 (kW*ic*oc=2*2*2). So dst[0,0,0,0]=0, dst[0,0,0,1]=1.
+        assert_eq!(out[0], 0, "[0,0,0,0]");
+        assert_eq!(out[1], 8, "[0,0,0,1] should be 8 (was oc=1,ic=0,h=0,w=0)");
+    }
+
+    #[test]
+    fn test_convert_nchw_to_nhwc_handles_int8_weights() {
+        use crate::builder::{CompiledOp, OpParams};
+
+        // 1 Conv op with an I8 weight [C_out=2, C_in=2, kH=2, kW=2].
+        let mut shapes = HashMap::new();
+        shapes.insert("x".into(), TensorShape::new(vec![1, 2, 4, 4], Dtype::F32));
+        shapes.insert("w".into(), TensorShape::new(vec![2, 2, 2, 2], Dtype::I8));
+        shapes.insert("y".into(), TensorShape::new(vec![1, 2, 3, 3], Dtype::F32));
+
+        let mut initializers = HashMap::new();
+        // 16 bytes of I8 weight data, distinguishable per element.
+        initializers.insert("w".into(), (0..16u8).collect());
+
+        let mut graph = Graph {
+            ops: vec![CompiledOp {
+                name: "conv".into(),
+                op_type: "Conv".into(),
+                inputs: vec!["x".into(), "w".into()],
+                outputs: vec!["y".into()],
+                params: OpParams::Conv2d {
+                    kernel_shape: [2, 2],
+                    strides: [1, 1],
+                    pads: [0, 0, 0, 0],
+                    dilations: [1, 1],
+                    group: 1,
+                },
+            }],
+            shapes,
+            inputs: vec!["x".into()],
+            outputs: vec!["y".into()],
+            initializers,
+            dtype: Dtype::F32,
+        };
+
+        convert_nchw_to_nhwc(&mut graph).expect("nhwc convert");
+
+        let w_shape = graph.shapes.get("w").unwrap();
+        // Shape flips OIHW [2,2,2,2] → HWIO [2,2,2,2] (square in this case
+        // but dimensions are reordered conceptually).
+        assert_eq!(w_shape.dims, vec![2, 2, 2, 2]);
+        assert_eq!(w_shape.dtype, Dtype::I8);
+
+        // Data must be the i8 transpose; original element at OIHW
+        // [oc=1, ic=0, h=0, w=0] (= byte 8) should now sit at HWIO
+        // [h=0, w=0, ic=0, oc=1] = index 1.
+        let w_data = graph.initializers.get("w").unwrap();
+        assert_eq!(w_data.len(), 16);
+        assert_eq!(w_data[1], 8);
     }
 
     #[test]

@@ -12,7 +12,8 @@ use std::time::{Duration, Instant};
 use dragonwing_core::Dtype;
 use dragonwing_onnx::{
     apply_fusion_passes, compile_model, convert_nchw_to_nhwc, count_fuseable_patterns,
-    fold_batchnorm, fold_gemm_transpose, transpose_nchw_to_nhwc, VulkanGraphRuntime,
+    fold_batchnorm, fold_gemm_transpose, fold_qdq_patterns, graph_has_qdq,
+    transpose_nchw_to_nhwc, VulkanGraphRuntime,
 };
 use dragonwing_vulkan::{VulkanBackend, VulkanConfig};
 
@@ -99,6 +100,32 @@ fn main() {
         }
     };
     println!("  ops    : {}", graph.ops.len());
+
+    // ----- Task 009 — QDQ fold (before NCHW→NHWC so axis=0 weight
+    // quantization sees OIHW layout). Cheap predicate skips when the
+    // model is plain F32. -----
+    if graph_has_qdq(&graph) {
+        println!("\n[Pass 2b] fold_qdq_patterns");
+        match fold_qdq_patterns(&mut graph) {
+            Ok(stats) => {
+                println!(
+                    "  conv_folded={} dq_removed={} q_removed={} weights_quantized={} qdq_unfolded={}",
+                    stats.conv_folded,
+                    stats.dequantize_removed,
+                    stats.quantize_removed,
+                    stats.weights_quantized,
+                    stats.qdq_unfolded,
+                );
+                println!("  ops after qdq fold: {}", graph.ops.len());
+            }
+            Err(e) => {
+                eprintln!("ERROR fold_qdq_patterns: {e}");
+                std::process::exit(1);
+            }
+        }
+    } else {
+        println!("\n[Pass 2b] fold_qdq_patterns (skipped — no QDQ nodes detected)");
+    }
 
     println!("\n[Pass 3] convert_nchw_to_nhwc");
     if let Err(e) = convert_nchw_to_nhwc(&mut graph) {

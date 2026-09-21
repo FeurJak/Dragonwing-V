@@ -269,14 +269,45 @@ Minimize requantization ops:
 - `crates/dragonwing-core/src/dtype.rs` - Dtype::I8 definition
 - `crates/dragonwing-cpu/src/ops.rs` - INT8 CPU ops (line 2949+)
 - `crates/dragonwing-onnx/src/calibration.rs` - Calibrator implementation
-- `crates/dragonwing-onnx/src/quantize.rs` - QuantizedGraphCompiler
+- `crates/dragonwing-onnx/src/quantize.rs` - QuantizedGraphCompiler (internal calibration path)
+- `crates/dragonwing-onnx/src/qdq.rs` - QDQ-fold pass for ONNX-format quantization (Task 009)
 - `crates/dragonwing-shaders/glsl/*_i8_packed.comp` - Vulkan INT8 shaders
 - `crates/dragonwing-test/src/int8_e2e.rs` - INT8 tests
+- `scripts/export_int8_onnx.py` - Ultralytics → ORT QDQ exporter (Task 009)
+
+## Two paths to INT8
+
+dragonwing-edge supports two complementary paths to INT8 inference:
+
+1. **Internal calibration** (`QuantizedGraphCompiler` + `Calibrator`).
+   Take an F32 ONNX model and ~100 representative input frames; the
+   calibrator measures activation ranges and the compiler emits an
+   INT8 graph. Use this when you only have F32 weights and your
+   deployment frames.
+
+2. **ONNX QDQ import** (`fold_qdq_patterns`, Task 009). Take a
+   QDQ-quantized ONNX model produced by ONNX Runtime / TensorRT /
+   our [`export_int8_onnx.py`](../scripts/export_int8_onnx.py)
+   helper; the fold pass rewrites the QDQ wrappers into native INT8
+   ops. Use this when you already have an INT8 model from another
+   toolchain or want to use ORT's mature PTQ algorithms.
+
+Both paths feed into the same fused `Conv2dRequantReluI8Nhwc` Vulkan
+shader. See [`onnx-qdq.md`](onnx-qdq.md) for the QDQ details.
 
 ## Future Work
 
+- [x] ~~ONNX QDQ format import~~ — landed in Task 009 (see `onnx-qdq.md`).
+- [ ] **Bias support in the fused INT8 conv shader.** Required to land
+      end-to-end INT8 YOLOv8m; today ~98% of real-world Ultralytics
+      convs carry bias and the fold pass skips them. See
+      `onnx-qdq.md` §8 for the implementation sketch.
+- [ ] **Per-channel requant in Vulkan.** The per-channel scales are
+      already plumbed through `TensorShape::per_channel_scales`; need
+      a shader that consumes them.
+- [ ] **Asymmetric quantization (non-zero zero-points)** for QDQ models
+      exported with default ORT settings.
 - [ ] Quantization-aware training (QAT) support
 - [ ] Per-group quantization for larger models
 - [ ] INT4 exploration (if hardware supports)
 - [ ] Dynamic quantization (per-batch scales)
-- [ ] ONNX QDQ format import

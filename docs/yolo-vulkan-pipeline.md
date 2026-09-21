@@ -44,10 +44,20 @@ Useful environment variables (see "Diagnostics" below):
        │                    │            shapes, ... }│
        │                    └──────────┬─────────────┘
        │                               │
+       │      Pass 2b (auto): fold_qdq_patterns        [Task 009]
+       │                               │   (skipped when no Q/DQ nodes
+       │                               │    detected; rewrites
+       │                               │    DQ+DQ→Conv→Q into native INT8
+       │                               │    Conv + Requantize matching the
+       │                               │    shape consumed by the fusion
+       │                               │    pass)
+       │                               ▼
        │      Pass 3: convert_nchw_to_nhwc
        │                               │   (transposes conv weights
        │                               │    [O,I,H,W] → [H,W,I,O] and
-       │                               │    activation shapes [N,C,H,W] → [N,H,W,C])
+       │                               │    activation shapes [N,C,H,W] → [N,H,W,C].
+       │                               │    Task 009 added INT8/F16
+       │                               │    weight-transpose paths.)
        │                               ▼
        │      Pass 4: fold_gemm_transpose
        │                               │   (pre-transposes Gemm B-weights so
@@ -56,7 +66,10 @@ Useful environment variables (see "Diagnostics" below):
        │                               ▼
        │      Pass 5 (optional, INT8 path):
        │                    QuantizedGraphCompiler::compile
-       │                               │   (requires calibration data)
+       │                               │   (requires calibration data —
+       │                               │    not needed when the model is
+       │                               │    already QDQ-quantized; in that
+       │                               │    case Pass 2b does the work)
        │                               ▼
        │      Pass 6: apply_fusion_passes
        │                               │   (Conv+Relu, Sigmoid×Mul → SiLU,
@@ -267,8 +280,53 @@ let out = rt.get_output_f32("output0")?;
 | YOLOv8n INT8 inference | <150 ms (<100 ms stretch) | not measured — needs calibration data |
 | YOLOv8m F32 inference | not a stated target | blocked at first mid-network conv by hangcheck (naive shader too slow on c_in=48, c_out=96 shape; ~1 GFLOP/dispatch) |
 
+## QDQ-format INT8 models (Task 009)
+
+When the loaded model contains `QuantizeLinear` / `DequantizeLinear`
+nodes (i.e., it was exported via ONNX Runtime static quantization,
+TensorRT, or the bundled
+[`scripts/export_int8_onnx.py`](../scripts/export_int8_onnx.py)),
+`yolo-benchmark` runs an additional **Pass 2b** between
+`compile_model` and `convert_nchw_to_nhwc`:
+
+```rust
+if dragonwing_onnx::graph_has_qdq(&graph) {
+    let stats = dragonwing_onnx::fold_qdq_patterns(&mut graph)?;
+    println!("conv_folded={} dq_removed={} q_removed={}",
+        stats.conv_folded,
+        stats.dequantize_removed,
+        stats.quantize_removed);
+}
+```
+
+The fold pass rewrites `DQ + DQ → Conv → Q` triples into native INT8
+`Conv + Requantize`, producing the exact graph shape the existing
+fusion pass expects. `apply_fusion_passes` then collapses each pair
+into `OpParams::Conv2dRequantReluI8Nhwc`.
+
+End-to-end workflow:
+
+```bash
+# 1. Export INT8 ONNX (one-time).
+python3 scripts/export_int8_onnx.py \
+    --pt artifacts/models/excavator_stone/truck.yolov8m.p640.20250512_best.pt \
+    --calib /path/to/calibration/images \
+    --out artifacts/models/truck.yolov8m.p640.int8.onnx \
+    --imgsz 640
+
+# 2. Run the benchmark (the QDQ-fold pass runs automatically).
+./target/release/yolo-benchmark artifacts/models/truck.yolov8m.p640.int8.onnx
+```
+
+Set `DRAGONWING_QDQ_DEBUG=1` to print one stderr line per conv that
+the fold pass *did not* match, with the rejection reason.
+
+See [`docs/onnx-qdq.md`](onnx-qdq.md) for the full format spec,
+fold pattern, and the v1 bias-skip limitation.
+
 ## See also
 
+- `docs/onnx-qdq.md` — ONNX QDQ format support (Task 009).
 - `docs/vulkan-runtime-integration.md` — `VulkanGraphRuntime`
   architecture, including Task 008 single-command-buffer + slab changes.
 - `docs/int8-vulkan.md` — UINT32 packing, INT8 shader bindings.
@@ -277,3 +335,4 @@ let out = rt.get_output_f32("output0")?;
 - `docs/quantization.md` — Calibration + `QuantizedGraphCompiler`.
 - `.task/implementation-task-008.md` — Per-phase findings, the GPU
   hangcheck investigation, and acceptance matrix.
+- `.task/implementation-task-009.md` — QDQ implementation findings.

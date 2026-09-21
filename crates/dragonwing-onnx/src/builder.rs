@@ -333,6 +333,36 @@ pub enum OpParams {
         scale: f32,
     },
     // =========================================================================
+    // Per-channel quantized op parameters (Task 009, ONNX QDQ)
+    // =========================================================================
+    /// Quantize F32 → INT8 with per-channel scales.
+    ///
+    /// Used by the ONNX `QuantizeLinear` op when its `y_scale` initializer is
+    /// a 1-D tensor (one scale per channel along `axis`). Zero-points are
+    /// stored separately and default to zero (symmetric quantization).
+    QuantizePerChannel {
+        /// Per-channel quantization scales, one per channel along `axis`.
+        scales: Vec<f32>,
+        /// Per-channel zero-points, one per channel along `axis`. For symmetric
+        /// quantization (the Ultralytics default) these are all zero.
+        zero_points: Vec<i8>,
+        /// Axis along which the per-channel scales apply (typically 0 for
+        /// weights and 1 for activations in NCHW).
+        axis: usize,
+    },
+    /// Dequantize INT8 → F32 with per-channel scales.
+    ///
+    /// Mirror of `QuantizePerChannel`. Produced from the ONNX
+    /// `DequantizeLinear` op when its `x_scale` is a 1-D tensor.
+    DequantizePerChannel {
+        /// Per-channel dequantization scales.
+        scales: Vec<f32>,
+        /// Per-channel zero-points.
+        zero_points: Vec<i8>,
+        /// Axis along which the per-channel scales apply.
+        axis: usize,
+    },
+    // =========================================================================
     // Fused quantized op parameters (Task 008)
     // =========================================================================
     /// Fused INT8 Conv2D (NHWC, packed) + Requantize INT32→INT8 + optional ReLU.
@@ -415,6 +445,9 @@ pub fn get_builder(op_type: &str) -> Option<&'static dyn OpBuilder> {
         "Slice" => Some(&SLICE_BUILDER),
         "Sub" => Some(&SUB_BUILDER),
         "Div" => Some(&DIV_BUILDER),
+        // ONNX QDQ ops (Task 009)
+        "QuantizeLinear" => Some(&QUANTIZE_LINEAR_BUILDER),
+        "DequantizeLinear" => Some(&DEQUANTIZE_LINEAR_BUILDER),
         _ => None,
     }
 }
@@ -556,10 +589,22 @@ impl OpBuilder for ConvBuilder {
     fn validate(&self, node: &OnnxNode, ctx: &BuildContext<'_>) -> Result<TensorShape> {
         let input_shape = ctx.get_shape(&node.inputs[0])
             .ok_or_else(|| Error::Validation(format!("input {} not found", node.inputs[0])))?;
-        
-        // Get kernel shape from weight tensor or attribute
-        let weight = ctx.get_initializer(&node.inputs[1])
-            .ok_or_else(|| Error::Validation(format!("weight {} must be constant", node.inputs[1])))?;
+
+        // Resolve weight dims: prefer the initializer (direct path) but
+        // fall back to the registered tensor shape. Task 009 QDQ-format
+        // models put the weight behind a DequantizeLinear, so the weight
+        // input is no longer a direct initializer — its shape was
+        // registered by the DQ builder instead.
+        let weight_dims: Vec<usize> = if let Some(init) = ctx.get_initializer(&node.inputs[1]) {
+            init.dims.iter().map(|&d| d as usize).collect()
+        } else if let Some(shape) = ctx.get_shape(&node.inputs[1]) {
+            shape.dims.clone()
+        } else {
+            return Err(Error::Validation(format!(
+                "Conv weight '{}' must be a constant initializer or have a registered shape",
+                node.inputs[1]
+            )));
+        };
         
         // Weight shape for Conv2D: [C_out, C_in/group, K_h, K_w] (OIHW)
         // Input shape: [N, C_in, H_in, W_in] (NCHW) for ONNX
@@ -568,7 +613,7 @@ impl OpBuilder for ConvBuilder {
         if input_shape.dims.len() != 4 {
             return Err(Error::Validation("Conv input must be 4D (NCHW)".into()));
         }
-        if weight.dims.len() != 4 {
+        if weight_dims.len() != 4 {
             return Err(Error::Validation("Conv weight must be 4D (OIHW)".into()));
         }
 
@@ -577,9 +622,9 @@ impl OpBuilder for ConvBuilder {
         let h_in = input_shape.dims[2];
         let w_in = input_shape.dims[3];
 
-        let c_out = weight.dims[0] as usize;
-        let k_h = weight.dims[2] as usize;
-        let k_w = weight.dims[3] as usize;
+        let c_out = weight_dims[0];
+        let k_h = weight_dims[2];
+        let k_w = weight_dims[3];
 
         let kernel_shape = node.get_attr_ints("kernel_shape");
         let (k_h, k_w) = if kernel_shape.len() == 2 {
@@ -622,9 +667,20 @@ impl OpBuilder for ConvBuilder {
         let output_shape = self.validate(node, ctx)?;
         
         let kernel_shape_attr = node.get_attr_ints("kernel_shape");
-        let weight = ctx.get_initializer(&node.inputs[1]).unwrap();
-        let k_h = if kernel_shape_attr.len() == 2 { kernel_shape_attr[0] as usize } else { weight.dims[2] as usize };
-        let k_w = if kernel_shape_attr.len() == 2 { kernel_shape_attr[1] as usize } else { weight.dims[3] as usize };
+        // Same dual lookup as validate(): initializer first, then registered
+        // shape (for QDQ-wrapped weights).
+        let weight_dims: Vec<usize> = if let Some(init) = ctx.get_initializer(&node.inputs[1]) {
+            init.dims.iter().map(|&d| d as usize).collect()
+        } else if let Some(shape) = ctx.get_shape(&node.inputs[1]) {
+            shape.dims.clone()
+        } else {
+            return Err(Error::Validation(format!(
+                "Conv weight '{}' not found",
+                node.inputs[1]
+            )));
+        };
+        let k_h = if kernel_shape_attr.len() == 2 { kernel_shape_attr[0] as usize } else { weight_dims[2] };
+        let k_w = if kernel_shape_attr.len() == 2 { kernel_shape_attr[1] as usize } else { weight_dims[3] };
 
         let strides = node.get_attr_ints("strides");
         let (stride_h, stride_w) = if strides.len() == 2 {
@@ -2096,7 +2152,15 @@ impl OpBuilder for SliceBuilder {
     }
 
     fn build(&self, node: &OnnxNode, ctx: &mut BuildContext<'_>) -> Result<CompiledOp> {
-        let input_shape = ctx.get_shape(&node.inputs[0]).unwrap().clone();
+        let input_shape = ctx
+            .get_shape(&node.inputs[0])
+            .ok_or_else(|| {
+                Error::Validation(format!(
+                    "Slice '{}': input '{}' has no shape registered",
+                    node.name, node.inputs[0]
+                ))
+            })?
+            .clone();
         let output_shape = self.validate(node, ctx)?;
         
         let starts: Vec<isize> = get_i64_constant(ctx, &node.inputs[1])?.iter().map(|&s| s as isize).collect();
@@ -2206,5 +2270,465 @@ impl OpBuilder for DivBuilder {
             outputs: node.outputs.clone(),
             params: OpParams::Div,
         })
+    }
+}
+
+// =============================================================================
+// QDQ Op Builders (Task 009 — ONNX QuantizeLinear / DequantizeLinear)
+// =============================================================================
+
+/// Read the scale initializer for a QDQ node as a Vec<f32>.
+///
+/// Accepts either a scalar (`dims == []`) or a 1-D `[C]` tensor. Errors if the
+/// initializer is missing or not F32.
+fn read_qdq_scale(ctx: &BuildContext<'_>, name: &str) -> Result<Vec<f32>> {
+    let init = ctx.get_initializer(name).ok_or_else(|| {
+        Error::Validation(format!(
+            "QDQ scale '{name}' must be a constant initializer (dynamic scales are not supported)"
+        ))
+    })?;
+    let slice = init.as_f32_slice().ok_or_else(|| {
+        Error::Validation(format!("QDQ scale '{name}' must be F32, got {:?}", init.data_type))
+    })?;
+    Ok(slice.to_vec())
+}
+
+/// Read the zero-point initializer for a QDQ node as a Vec<i8>.
+///
+/// Returns a single-element `[0]` vector when the input is missing or empty
+/// (ONNX spec: zero-point is optional and defaults to 0). Accepts INT8 or
+/// UINT8 tensors; UINT8 values are reinterpreted as i8 (caller is responsible
+/// for ensuring the model uses symmetric / signed quantization).
+fn read_qdq_zero_point(ctx: &BuildContext<'_>, name: &str) -> Result<Vec<i8>> {
+    if name.is_empty() {
+        return Ok(vec![0]);
+    }
+    let Some(init) = ctx.get_initializer(name) else {
+        // Missing optional input — treat as zero.
+        return Ok(vec![0]);
+    };
+    match init.data_type {
+        DataType::Int8 | DataType::Uint8 => {
+            // Raw bytes are i8/u8; reinterpret as i8.
+            let zp: Vec<i8> = init.data.iter().map(|&b| b as i8).collect();
+            if zp.is_empty() {
+                Ok(vec![0])
+            } else {
+                Ok(zp)
+            }
+        }
+        DataType::Int32 => {
+            // Some exporters emit INT32 zero-points; downcast.
+            if init.data.len() % 4 != 0 {
+                return Err(Error::Validation(format!(
+                    "QDQ zero-point '{name}' INT32 data length not multiple of 4"
+                )));
+            }
+            let zp: Vec<i8> = init
+                .data
+                .chunks_exact(4)
+                .map(|b| {
+                    let v = i32::from_le_bytes([b[0], b[1], b[2], b[3]]);
+                    v.clamp(i8::MIN as i32, i8::MAX as i32) as i8
+                })
+                .collect();
+            Ok(if zp.is_empty() { vec![0] } else { zp })
+        }
+        other => Err(Error::Validation(format!(
+            "QDQ zero-point '{name}' must be INT8/UINT8/INT32, got {other:?}"
+        ))),
+    }
+}
+
+/// Resolve the per-channel axis for a QDQ node.
+///
+/// ONNX 13+ exposes an `axis` attribute on QuantizeLinear / DequantizeLinear.
+/// Older opsets default to axis=1. For scalar (per-tensor) quantization the
+/// axis is ignored.
+fn qdq_axis(node: &OnnxNode, rank: usize) -> usize {
+    let raw = node.get_attr_int("axis", 1);
+    let normalized = if raw < 0 { raw + rank as i64 } else { raw };
+    normalized.max(0) as usize
+}
+
+// --- QuantizeLinear ---
+struct QuantizeLinearBuilder;
+static QUANTIZE_LINEAR_BUILDER: QuantizeLinearBuilder = QuantizeLinearBuilder;
+
+impl OpBuilder for QuantizeLinearBuilder {
+    fn op_type(&self) -> &'static str {
+        "QuantizeLinear"
+    }
+
+    fn is_supported(
+        &self,
+        node: &OnnxNode,
+        ctx: &BuildContext<'_>,
+    ) -> std::result::Result<(), UnsupportedReason> {
+        if node.inputs.len() < 2 || node.inputs.len() > 3 {
+            return Err(UnsupportedReason::UnsupportedInputCount {
+                found: node.inputs.len(),
+                expected: "2-3",
+            });
+        }
+        // Scale must be a constant initializer (static quantization).
+        if !ctx.is_initializer(&node.inputs[1]) {
+            return Err(UnsupportedReason::Other(format!(
+                "QuantizeLinear y_scale '{}' must be a constant initializer",
+                node.inputs[1]
+            )));
+        }
+        Ok(())
+    }
+
+    fn validate(&self, node: &OnnxNode, ctx: &BuildContext<'_>) -> Result<TensorShape> {
+        let input_shape = ctx.get_shape(&node.inputs[0]).ok_or_else(|| {
+            Error::Validation(format!("input {} not found", node.inputs[0]))
+        })?;
+        // QuantizeLinear preserves shape; only dtype changes to I8.
+        Ok(TensorShape::new(input_shape.dims.clone(), Dtype::I8))
+    }
+
+    fn build(&self, node: &OnnxNode, ctx: &mut BuildContext<'_>) -> Result<CompiledOp> {
+        let input_shape = ctx.get_shape(&node.inputs[0])
+            .ok_or_else(|| Error::Validation(format!("input {} not found", node.inputs[0])))?
+            .clone();
+
+        let scales = read_qdq_scale(ctx, &node.inputs[1])?;
+        let zp_name = node.inputs.get(2).cloned().unwrap_or_default();
+        let mut zero_points = read_qdq_zero_point(ctx, &zp_name)?;
+
+        let is_per_channel = scales.len() > 1;
+        let axis = qdq_axis(node, input_shape.dims.len());
+
+        // Reject non-zero zero-points (asymmetric quantization is out of scope
+        // for task 009 — Ultralytics export uses symmetric).
+        if zero_points.iter().any(|&z| z != 0) {
+            return Err(Error::Validation(format!(
+                "QuantizeLinear '{}' uses asymmetric quantization (non-zero zero-point); only symmetric is supported",
+                node.name
+            )));
+        }
+
+        let params = if is_per_channel {
+            // Broadcast scalar zero-point to per-channel length if needed.
+            if zero_points.len() == 1 {
+                zero_points = vec![zero_points[0]; scales.len()];
+            } else if zero_points.len() != scales.len() {
+                return Err(Error::Validation(format!(
+                    "QuantizeLinear '{}' scale length {} != zero-point length {}",
+                    node.name,
+                    scales.len(),
+                    zero_points.len()
+                )));
+            }
+            OpParams::QuantizePerChannel { scales, zero_points, axis }
+        } else {
+            OpParams::Quantize { scale: scales[0] }
+        };
+
+        // Output shape: same dims, I8 dtype. Stamp scale onto the shape for
+        // downstream passes (qdq-fold, fusion).
+        let mut out_shape = TensorShape::new(input_shape.dims.clone(), Dtype::I8);
+        if let OpParams::Quantize { scale } = &params {
+            out_shape.scale = Some(QuantScale::symmetric(*scale));
+        }
+        if let OpParams::QuantizePerChannel { scales, .. } = &params {
+            out_shape.per_channel_scales =
+                Some(PerChannelScale::new(scales.clone()));
+        }
+        ctx.set_shape(node.outputs[0].clone(), out_shape);
+
+        Ok(CompiledOp {
+            name: node.name.clone(),
+            op_type: "QuantizeLinear".into(),
+            // The runtime only ever consumes the data input; scale/zero-point
+            // are baked into params.
+            inputs: vec![node.inputs[0].clone()],
+            outputs: node.outputs.clone(),
+            params,
+        })
+    }
+}
+
+// --- DequantizeLinear ---
+struct DequantizeLinearBuilder;
+static DEQUANTIZE_LINEAR_BUILDER: DequantizeLinearBuilder = DequantizeLinearBuilder;
+
+impl OpBuilder for DequantizeLinearBuilder {
+    fn op_type(&self) -> &'static str {
+        "DequantizeLinear"
+    }
+
+    fn is_supported(
+        &self,
+        node: &OnnxNode,
+        ctx: &BuildContext<'_>,
+    ) -> std::result::Result<(), UnsupportedReason> {
+        if node.inputs.len() < 2 || node.inputs.len() > 3 {
+            return Err(UnsupportedReason::UnsupportedInputCount {
+                found: node.inputs.len(),
+                expected: "2-3",
+            });
+        }
+        if !ctx.is_initializer(&node.inputs[1]) {
+            return Err(UnsupportedReason::Other(format!(
+                "DequantizeLinear x_scale '{}' must be a constant initializer",
+                node.inputs[1]
+            )));
+        }
+        Ok(())
+    }
+
+    fn validate(&self, node: &OnnxNode, ctx: &BuildContext<'_>) -> Result<TensorShape> {
+        let input_shape = ctx.get_shape(&node.inputs[0]).ok_or_else(|| {
+            Error::Validation(format!("input {} not found", node.inputs[0]))
+        })?;
+        // DequantizeLinear preserves shape; dtype becomes F32.
+        Ok(TensorShape::new(input_shape.dims.clone(), Dtype::F32))
+    }
+
+    fn build(&self, node: &OnnxNode, ctx: &mut BuildContext<'_>) -> Result<CompiledOp> {
+        let input_shape = ctx.get_shape(&node.inputs[0])
+            .ok_or_else(|| Error::Validation(format!("input {} not found", node.inputs[0])))?
+            .clone();
+
+        let scales = read_qdq_scale(ctx, &node.inputs[1])?;
+        let zp_name = node.inputs.get(2).cloned().unwrap_or_default();
+        let mut zero_points = read_qdq_zero_point(ctx, &zp_name)?;
+
+        let is_per_channel = scales.len() > 1;
+        let axis = qdq_axis(node, input_shape.dims.len());
+
+        if zero_points.iter().any(|&z| z != 0) {
+            return Err(Error::Validation(format!(
+                "DequantizeLinear '{}' uses asymmetric quantization (non-zero zero-point); only symmetric is supported",
+                node.name
+            )));
+        }
+
+        let params = if is_per_channel {
+            if zero_points.len() == 1 {
+                zero_points = vec![zero_points[0]; scales.len()];
+            } else if zero_points.len() != scales.len() {
+                return Err(Error::Validation(format!(
+                    "DequantizeLinear '{}' scale length {} != zero-point length {}",
+                    node.name,
+                    scales.len(),
+                    zero_points.len()
+                )));
+            }
+            OpParams::DequantizePerChannel { scales, zero_points, axis }
+        } else {
+            OpParams::Dequantize { scale: scales[0] }
+        };
+
+        // Output shape: same dims, F32 dtype.
+        let out_shape = TensorShape::new(input_shape.dims.clone(), Dtype::F32);
+        ctx.set_shape(node.outputs[0].clone(), out_shape);
+
+        Ok(CompiledOp {
+            name: node.name.clone(),
+            op_type: "DequantizeLinear".into(),
+            inputs: vec![node.inputs[0].clone()],
+            outputs: node.outputs.clone(),
+            params,
+        })
+    }
+}
+
+// =============================================================================
+// Tests (Task 009 — QDQ builders)
+// =============================================================================
+
+#[cfg(test)]
+mod qdq_tests {
+    use super::*;
+    use crate::model::{AttributeValue, OnnxAttribute, OnnxNode, OnnxTensor};
+
+    fn f32_init(name: &str, dims: Vec<i64>, data: Vec<f32>) -> OnnxTensor {
+        let bytes: Vec<u8> = data.iter().flat_map(|f| f.to_le_bytes()).collect();
+        OnnxTensor {
+            name: name.into(),
+            dims,
+            data_type: DataType::Float,
+            data: bytes,
+        }
+    }
+
+    fn i8_init(name: &str, dims: Vec<i64>, data: Vec<i8>) -> OnnxTensor {
+        let bytes: Vec<u8> = data.iter().map(|&v| v as u8).collect();
+        OnnxTensor {
+            name: name.into(),
+            dims,
+            data_type: DataType::Int8,
+            data: bytes,
+        }
+    }
+
+    fn build_node(op_type: &str, inputs: Vec<&str>, outputs: Vec<&str>) -> OnnxNode {
+        OnnxNode {
+            name: format!("{op_type}_test"),
+            op_type: op_type.into(),
+            inputs: inputs.into_iter().map(|s| s.into()).collect(),
+            outputs: outputs.into_iter().map(|s| s.into()).collect(),
+            attributes: vec![],
+        }
+    }
+
+    #[test]
+    fn quantize_linear_per_tensor_builds() {
+        let mut inits: HashMap<String, OnnxTensor> = HashMap::new();
+        inits.insert("scale".into(), f32_init("scale", vec![], vec![0.5]));
+        inits.insert("zp".into(), i8_init("zp", vec![], vec![0]));
+
+        let mut ctx = BuildContext::new(Dtype::F32, &inits);
+        ctx.set_shape("x".into(), TensorShape::new(vec![1, 3, 4, 4], Dtype::F32));
+
+        let node = build_node("QuantizeLinear", vec!["x", "scale", "zp"], vec!["x_q"]);
+        let builder = get_builder("QuantizeLinear").expect("builder registered");
+
+        builder.is_supported(&node, &ctx).expect("supported");
+        let op = builder.build(&node, &mut ctx).expect("build ok");
+
+        assert_eq!(op.op_type, "QuantizeLinear");
+        assert_eq!(op.inputs, vec!["x"]);
+        assert_eq!(op.outputs, vec!["x_q"]);
+        match op.params {
+            OpParams::Quantize { scale } => assert!((scale - 0.5).abs() < 1e-6),
+            other => panic!("expected Quantize, got {other:?}"),
+        }
+        let out_shape = ctx.get_shape("x_q").unwrap();
+        assert_eq!(out_shape.dtype, Dtype::I8);
+        assert_eq!(out_shape.dims, vec![1, 3, 4, 4]);
+        assert!(out_shape.scale.is_some());
+    }
+
+    #[test]
+    fn quantize_linear_missing_zero_point_defaults_to_zero() {
+        let mut inits: HashMap<String, OnnxTensor> = HashMap::new();
+        inits.insert("scale".into(), f32_init("scale", vec![], vec![0.25]));
+
+        let mut ctx = BuildContext::new(Dtype::F32, &inits);
+        ctx.set_shape("x".into(), TensorShape::new(vec![8], Dtype::F32));
+
+        // Only 2 inputs (no zero-point).
+        let node = build_node("QuantizeLinear", vec!["x", "scale"], vec!["x_q"]);
+        let builder = get_builder("QuantizeLinear").unwrap();
+        let op = builder.build(&node, &mut ctx).expect("build ok");
+        assert!(matches!(op.params, OpParams::Quantize { .. }));
+    }
+
+    #[test]
+    fn quantize_linear_per_channel_builds() {
+        let mut inits: HashMap<String, OnnxTensor> = HashMap::new();
+        inits.insert(
+            "scale".into(),
+            f32_init("scale", vec![4], vec![0.1, 0.2, 0.3, 0.4]),
+        );
+        inits.insert("zp".into(), i8_init("zp", vec![4], vec![0, 0, 0, 0]));
+
+        let mut ctx = BuildContext::new(Dtype::F32, &inits);
+        ctx.set_shape("w".into(), TensorShape::new(vec![4, 8, 3, 3], Dtype::F32));
+
+        // axis=0 per-channel on the output dim (common for weights).
+        let mut node = build_node("QuantizeLinear", vec!["w", "scale", "zp"], vec!["w_q"]);
+        node.attributes.push(OnnxAttribute {
+            name: "axis".into(),
+            value: AttributeValue::Int(0),
+        });
+
+        let builder = get_builder("QuantizeLinear").unwrap();
+        let op = builder.build(&node, &mut ctx).expect("build ok");
+
+        match &op.params {
+            OpParams::QuantizePerChannel { scales, zero_points, axis } => {
+                assert_eq!(scales.len(), 4);
+                assert_eq!(zero_points.len(), 4);
+                assert_eq!(*axis, 0);
+            }
+            other => panic!("expected per-channel, got {other:?}"),
+        }
+        let out_shape = ctx.get_shape("w_q").unwrap();
+        assert!(out_shape.per_channel_scales.is_some());
+    }
+
+    #[test]
+    fn quantize_linear_rejects_asymmetric() {
+        let mut inits: HashMap<String, OnnxTensor> = HashMap::new();
+        inits.insert("scale".into(), f32_init("scale", vec![], vec![0.5]));
+        inits.insert("zp".into(), i8_init("zp", vec![], vec![10])); // non-zero
+
+        let mut ctx = BuildContext::new(Dtype::F32, &inits);
+        ctx.set_shape("x".into(), TensorShape::new(vec![1, 4], Dtype::F32));
+
+        let node = build_node("QuantizeLinear", vec!["x", "scale", "zp"], vec!["x_q"]);
+        let builder = get_builder("QuantizeLinear").unwrap();
+        let err = builder.build(&node, &mut ctx).expect_err("should reject");
+        let msg = format!("{err}");
+        assert!(msg.contains("asymmetric"), "unexpected message: {msg}");
+    }
+
+    #[test]
+    fn dequantize_linear_per_tensor_builds() {
+        let mut inits: HashMap<String, OnnxTensor> = HashMap::new();
+        inits.insert("scale".into(), f32_init("scale", vec![], vec![0.125]));
+
+        let mut ctx = BuildContext::new(Dtype::F32, &inits);
+        ctx.set_shape("x_q".into(), TensorShape::new(vec![1, 16], Dtype::I8));
+
+        let node = build_node("DequantizeLinear", vec!["x_q", "scale"], vec!["x_dq"]);
+        let builder = get_builder("DequantizeLinear").unwrap();
+        let op = builder.build(&node, &mut ctx).expect("build ok");
+
+        match op.params {
+            OpParams::Dequantize { scale } => assert!((scale - 0.125).abs() < 1e-6),
+            other => panic!("expected Dequantize, got {other:?}"),
+        }
+        let out_shape = ctx.get_shape("x_dq").unwrap();
+        assert_eq!(out_shape.dtype, Dtype::F32);
+    }
+
+    #[test]
+    fn dequantize_linear_per_channel_builds() {
+        let mut inits: HashMap<String, OnnxTensor> = HashMap::new();
+        inits.insert(
+            "scale".into(),
+            f32_init("scale", vec![3], vec![0.1, 0.2, 0.3]),
+        );
+
+        let mut ctx = BuildContext::new(Dtype::F32, &inits);
+        ctx.set_shape("w_q".into(), TensorShape::new(vec![3, 4, 1, 1], Dtype::I8));
+
+        let mut node = build_node("DequantizeLinear", vec!["w_q", "scale"], vec!["w_dq"]);
+        node.attributes.push(OnnxAttribute {
+            name: "axis".into(),
+            value: AttributeValue::Int(0),
+        });
+
+        let builder = get_builder("DequantizeLinear").unwrap();
+        let op = builder.build(&node, &mut ctx).expect("build ok");
+
+        match &op.params {
+            OpParams::DequantizePerChannel { scales, axis, .. } => {
+                assert_eq!(scales.len(), 3);
+                assert_eq!(*axis, 0);
+            }
+            other => panic!("expected per-channel dequantize, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn quantize_linear_rejects_dynamic_scale() {
+        // Scale not in initializers → not supported.
+        let inits: HashMap<String, OnnxTensor> = HashMap::new();
+        let mut ctx = BuildContext::new(Dtype::F32, &inits);
+        ctx.set_shape("x".into(), TensorShape::new(vec![4], Dtype::F32));
+        ctx.set_shape("scale".into(), TensorShape::new(vec![], Dtype::F32));
+
+        let node = build_node("QuantizeLinear", vec!["x", "scale"], vec!["x_q"]);
+        let builder = get_builder("QuantizeLinear").unwrap();
+        let res = builder.is_supported(&node, &ctx);
+        assert!(res.is_err());
     }
 }

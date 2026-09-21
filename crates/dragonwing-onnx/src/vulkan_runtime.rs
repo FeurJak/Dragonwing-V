@@ -591,6 +591,18 @@ impl VulkanGraphRuntime {
             } => self.dispatch_add_quantized(op, *scale_a_over_out, *scale_b_over_out),
             OpParams::Quantize { scale } => self.dispatch_quantize(op, *scale),
             OpParams::Dequantize { scale } => self.dispatch_dequantize(op, *scale),
+            // ----- Per-channel QDQ (Task 009) ---------------------------
+            // No native Vulkan shader; the QDQ-fold pass should strip these
+            // before runtime. Falling back via the CPU path is possible but
+            // expensive; for now emit a clear error so the user knows the
+            // fold pass either did not run or could not handle the model.
+            OpParams::QuantizePerChannel { .. } | OpParams::DequantizePerChannel { .. } => {
+                Err(Error::Runtime(format!(
+                    "{} (per-channel QDQ) reached VulkanGraphRuntime; \
+                     ensure fold_qdq_patterns() was applied before runtime construction",
+                    op.op_type
+                )))
+            }
 
             // ----- Fused INT8 ops (Phase 1 of Task 008) ------------------
             OpParams::Conv2dRequantReluI8Nhwc {
@@ -726,6 +738,14 @@ impl VulkanGraphRuntime {
                 "op {:?} not yet supported by VulkanGraphRuntime (record path)",
                 op.op_type
             ))),
+            // Per-channel QDQ should be folded away before the runtime sees them.
+            OpParams::QuantizePerChannel { .. } | OpParams::DequantizePerChannel { .. } => {
+                Err(Error::Runtime(format!(
+                    "{} (per-channel QDQ) reached VulkanGraphRuntime (record path); \
+                     run fold_qdq_patterns() before constructing the runtime",
+                    op.op_type
+                )))
+            }
         }
     }
 

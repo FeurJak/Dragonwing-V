@@ -327,6 +327,8 @@ impl Calibrator {
             | OpParams::AddQuantized { .. }
             | OpParams::Quantize { .. }
             | OpParams::Dequantize { .. }
+            | OpParams::QuantizePerChannel { .. }
+            | OpParams::DequantizePerChannel { .. }
             | OpParams::Conv2dRequantReluI8Nhwc { .. } => Ok(()),
         }
     }

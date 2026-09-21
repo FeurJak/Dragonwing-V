@@ -179,7 +179,8 @@ impl<B: Backend> GraphRuntime<B> {
             }
             // Quantized ops (Task 006) - defer to specialized runtime
             OpParams::Requantize { .. } | OpParams::AddQuantized { .. } |
-            OpParams::Quantize { .. } | OpParams::Dequantize { .. } => {
+            OpParams::Quantize { .. } | OpParams::Dequantize { .. } |
+            OpParams::QuantizePerChannel { .. } | OpParams::DequantizePerChannel { .. } => {
                 return Err(Error::Runtime(format!(
                     "{} (quantized) not implemented in generic runtime",
                     op.op_type
@@ -928,6 +929,15 @@ mod cpu_runtime {
                 }
                 OpParams::Quantize { scale } => self.dispatch_quantize(op, *scale),
                 OpParams::Dequantize { scale } => self.dispatch_dequantize(op, *scale),
+                // Per-channel QDQ (Task 009) — implemented on CPU. Vulkan path
+                // is intentionally absent for now; the QDQ-fold pass should
+                // strip these before the runtime sees them in production.
+                OpParams::QuantizePerChannel { scales, zero_points, axis } => {
+                    self.dispatch_quantize_per_channel(op, scales, zero_points, *axis)
+                }
+                OpParams::DequantizePerChannel { scales, zero_points, axis } => {
+                    self.dispatch_dequantize_per_channel(op, scales, zero_points, *axis)
+                }
                 // Fused quantized ops (Task 008) - not implemented on CPU; require
                 // VulkanGraphRuntime. Emit a clear error so callers know to switch
                 // backends or skip fusion when targeting CPU.
@@ -2255,6 +2265,220 @@ mod cpu_runtime {
 
             ops::dequantize_i8_to_f32(output_f32, input_i8, scale);
             Ok(())
+        }
+
+        // ---- Per-channel QDQ (Task 009) ----
+
+        fn dispatch_quantize_per_channel(
+            &mut self,
+            op: &CompiledOp,
+            scales: &[f32],
+            zero_points: &[i8],
+            axis: usize,
+        ) -> Result<()> {
+            let input_name = &op.inputs[0];
+            let output_name = &op.outputs[0];
+            let dims = self
+                .graph
+                .shapes
+                .get(input_name)
+                .ok_or_else(|| Error::Runtime(format!("shape not found: {input_name}")))?
+                .dims
+                .clone();
+
+            let (input_ptr, output_ptr) = {
+                let input_buf = self.buffers.get(input_name)
+                    .ok_or_else(|| Error::Runtime(format!("buffer not found: {input_name}")))?;
+                let output_buf = self.buffers.get(output_name)
+                    .ok_or_else(|| Error::Runtime(format!("buffer not found: {output_name}")))?;
+                (input_buf as *const CpuBuffer, output_buf as *const CpuBuffer as *mut CpuBuffer)
+            };
+            let input_f32 = unsafe { (*input_ptr).as_f32() };
+            let output_i8 = unsafe { (*output_ptr).as_i8_mut() };
+
+            quantize_per_channel_f32_to_i8(output_i8, input_f32, &dims, axis, scales, zero_points);
+            Ok(())
+        }
+
+        fn dispatch_dequantize_per_channel(
+            &mut self,
+            op: &CompiledOp,
+            scales: &[f32],
+            zero_points: &[i8],
+            axis: usize,
+        ) -> Result<()> {
+            let input_name = &op.inputs[0];
+            let output_name = &op.outputs[0];
+            let dims = self
+                .graph
+                .shapes
+                .get(input_name)
+                .ok_or_else(|| Error::Runtime(format!("shape not found: {input_name}")))?
+                .dims
+                .clone();
+
+            let (input_ptr, output_ptr) = {
+                let input_buf = self.buffers.get(input_name)
+                    .ok_or_else(|| Error::Runtime(format!("buffer not found: {input_name}")))?;
+                let output_buf = self.buffers.get(output_name)
+                    .ok_or_else(|| Error::Runtime(format!("buffer not found: {output_name}")))?;
+                (input_buf as *const CpuBuffer, output_buf as *const CpuBuffer as *mut CpuBuffer)
+            };
+            let input_i8 = unsafe { (*input_ptr).as_i8() };
+            let output_f32 = unsafe { (*output_ptr).as_f32_mut() };
+
+            dequantize_per_channel_i8_to_f32(output_f32, input_i8, &dims, axis, scales, zero_points);
+            Ok(())
+        }
+    }
+
+    // ---- Per-channel QDQ kernels (Task 009) ----
+
+    /// Quantize F32 → INT8 with one scale (and zero-point) per index along
+    /// `axis`. Outer / inner strides are derived from `dims`.
+    pub(super) fn quantize_per_channel_f32_to_i8(
+        out: &mut [i8],
+        input: &[f32],
+        dims: &[usize],
+        axis: usize,
+        scales: &[f32],
+        zero_points: &[i8],
+    ) {
+        assert_eq!(out.len(), input.len(), "per-channel quantize length mismatch");
+        if dims.is_empty() {
+            // Degenerate: treat as scalar with first scale.
+            let s = scales[0];
+            let zp = zero_points[0] as f32;
+            let q = (input[0] / s + zp).round().clamp(-128.0, 127.0) as i8;
+            out[0] = q;
+            return;
+        }
+        let axis = axis.min(dims.len() - 1);
+        let channels = dims[axis];
+        let outer: usize = dims[..axis].iter().product();
+        let inner: usize = dims[axis + 1..].iter().product();
+        assert_eq!(scales.len(), channels, "per-channel scale count mismatch");
+        assert_eq!(zero_points.len(), channels, "per-channel zp count mismatch");
+
+        for o in 0..outer {
+            for c in 0..channels {
+                let s = scales[c];
+                let zp = zero_points[c] as f32;
+                let base = (o * channels + c) * inner;
+                for i in 0..inner {
+                    let v = input[base + i] / s + zp;
+                    out[base + i] = v.round().clamp(-128.0, 127.0) as i8;
+                }
+            }
+        }
+    }
+
+    /// Inverse of `quantize_per_channel_f32_to_i8`.
+    pub(super) fn dequantize_per_channel_i8_to_f32(
+        out: &mut [f32],
+        input: &[i8],
+        dims: &[usize],
+        axis: usize,
+        scales: &[f32],
+        zero_points: &[i8],
+    ) {
+        assert_eq!(out.len(), input.len(), "per-channel dequantize length mismatch");
+        if dims.is_empty() {
+            let s = scales[0];
+            let zp = zero_points[0] as f32;
+            out[0] = (input[0] as f32 - zp) * s;
+            return;
+        }
+        let axis = axis.min(dims.len() - 1);
+        let channels = dims[axis];
+        let outer: usize = dims[..axis].iter().product();
+        let inner: usize = dims[axis + 1..].iter().product();
+        assert_eq!(scales.len(), channels);
+        assert_eq!(zero_points.len(), channels);
+
+        for o in 0..outer {
+            for c in 0..channels {
+                let s = scales[c];
+                let zp = zero_points[c] as f32;
+                let base = (o * channels + c) * inner;
+                for i in 0..inner {
+                    out[base + i] = (input[base + i] as f32 - zp) * s;
+                }
+            }
+        }
+    }
+
+    #[cfg(test)]
+    mod per_channel_tests {
+        use super::*;
+
+        #[test]
+        fn quantize_per_channel_applies_per_channel_scale() {
+            // 1x4 (C=4): each channel gets a different scale.
+            // dims=[1,4], axis=1 → outer=1, channels=4, inner=1.
+            let input: Vec<f32> = vec![1.0, 2.0, 3.0, 4.0];
+            let scales = vec![0.5, 1.0, 1.5, 2.0]; // q = round(x / s)
+            let zps = vec![0i8; 4];
+            let mut out = vec![0i8; 4];
+
+            quantize_per_channel_f32_to_i8(&mut out, &input, &[1, 4], 1, &scales, &zps);
+
+            // Expected: [round(1/.5)=2, round(2/1)=2, round(3/1.5)=2, round(4/2)=2]
+            assert_eq!(out, vec![2, 2, 2, 2]);
+        }
+
+        #[test]
+        fn quantize_dequantize_round_trip_per_channel() {
+            // [N=1, C=3, H=2, W=2] tensor, axis=1.
+            let dims = vec![1usize, 3, 2, 2];
+            let numel: usize = dims.iter().product();
+            let input: Vec<f32> = (0..numel).map(|i| (i as f32) * 0.1).collect();
+            let scales = vec![0.05, 0.1, 0.15];
+            let zps = vec![0i8; 3];
+
+            let mut q = vec![0i8; numel];
+            quantize_per_channel_f32_to_i8(&mut q, &input, &dims, 1, &scales, &zps);
+
+            let mut dq = vec![0f32; numel];
+            dequantize_per_channel_i8_to_f32(&mut dq, &q, &dims, 1, &scales, &zps);
+
+            // Round-trip error should be bounded by largest scale / 2.
+            let max_err = scales.iter().cloned().fold(0.0, f32::max) / 2.0 + 1e-5;
+            for (orig, recon) in input.iter().zip(dq.iter()) {
+                let err = (orig - recon).abs();
+                assert!(
+                    err <= max_err,
+                    "round-trip error {err} exceeds bound {max_err} (orig={orig}, recon={recon})"
+                );
+            }
+        }
+
+        #[test]
+        fn quantize_per_channel_axis_zero() {
+            // [C=2, H=3] tensor, axis=0 (per-row scaling).
+            let dims = vec![2usize, 3];
+            let input: Vec<f32> = vec![
+                1.0, 2.0, 3.0,    // channel 0, scale=0.5 → q=2,4,6
+                10.0, 20.0, 30.0, // channel 1, scale=10  → q=1,2,3
+            ];
+            let scales = vec![0.5, 10.0];
+            let zps = vec![0i8; 2];
+            let mut out = vec![0i8; 6];
+
+            quantize_per_channel_f32_to_i8(&mut out, &input, &dims, 0, &scales, &zps);
+            assert_eq!(out, vec![2, 4, 6, 1, 2, 3]);
+        }
+
+        #[test]
+        fn quantize_per_channel_saturates() {
+            // Overflow values clamp to i8 range.
+            let scales = vec![0.01f32];
+            let zps = vec![0i8];
+            let input = vec![10.0f32, -10.0, 0.0];
+            let mut out = vec![0i8; 3];
+
+            quantize_per_channel_f32_to_i8(&mut out, &input, &[1, 3], 0, &scales, &zps);
+            assert_eq!(out, vec![127, -128, 0]);
         }
     }
 }
