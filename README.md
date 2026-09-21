@@ -1,3 +1,3 @@
 # dragonwing-edge-rs
 
-Edge Inference Framework on the Qualcomm Dragooning Platform, written in rust.
+Edge Inference Framework on the Qualcomm Dragonwing Platform, written in rust.
