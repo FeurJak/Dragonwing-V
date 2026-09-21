@@ -17,7 +17,7 @@
 //!
 //! ```sh
 //! # Build on device (cross-compile from macOS is painful with Vulkan loader)
-//! cd ~/dragonwing-edge-rs
+//! cd ~/Dragonwing-V
 //! PATH=~/.cargo/bin:$PATH \
 //!   cargo build -p dragonwing-test --bin device-benchmark --release
 //! ./target/release/device-benchmark

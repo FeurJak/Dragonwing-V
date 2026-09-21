@@ -14,7 +14,7 @@
 //!
 //! # Integration recipe
 //!
-//! 1. Add `dragonwing-edge = { git = "https://github.com/FeurJak/dragonwing-edge-rs" }`
+//! 1. Add `dragonwing-edge = { git = "https://github.com/FeurJak/Dragonwing-V" }`
 //!    to your `Cargo.toml`. Pick a tag once the project releases them.
 //! 2. Run [`hal::probe_all`] once at process startup to discover what the
 //!    device can do.
